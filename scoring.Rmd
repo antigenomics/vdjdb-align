@@ -1,0 +1,740 @@
+---
+title: "Computing scoring matrix for CDR3s"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(data.table)
+library(dplyr)
+library(dtplyr)
+library(ggplot2)
+library(reshape2)
+library(parallel)
+library(stringdist)
+library(stringr)
+library(NMF)
+library(igraph)
+library(RColorBrewer)
+library(MASS)
+library(Biostrings)
+select = dplyr::select
+```
+
+## Preprocessing
+
+Load data
+
+```{r}
+dt.vdjdb = fread("vdjdb.slim.txt") %>%
+  mutate(len = nchar(cdr3)) %>%
+  select(species, antigen.epitope, gene, cdr3, v.end, j.start, len) %>%
+  unique %>%
+  group_by(species, antigen.epitope, gene, cdr3, len) %>%
+  summarise(v.end = max(v.end), j.start = min(j.start)) %>%
+  filter(startsWith(cdr3, "C"), endsWith(cdr3, "F") | endsWith(cdr3, "W"),
+         v.end >= 0, j.start >= 0,
+         species != "MacacaMulatta")
+```
+
+Filter epitopes: at least 30 CDR3s per epitope
+
+```{r}
+dt.epi.count = dt.vdjdb %>%
+  group_by(species, antigen.epitope, gene) %>%
+  summarise(count = length(unique(cdr3))) %>%
+  arrange(-count)
+
+print(dt.epi.count)
+
+epi.good = dt.epi.count %>%
+  filter(count >= 30) %>%
+  select(species, gene, antigen.epitope)
+
+dt.vdjdb.good = dt.vdjdb %>%
+  merge(epi.good)
+```
+
+Spectratype
+
+```{r}
+dt.vdjdb.spectra = dt.vdjdb %>%
+  as.data.frame %>%
+  group_by(species, gene, len = nchar(cdr3)) %>%
+  summarise(count = n())
+
+ggplot(dt.vdjdb.spectra, aes(x = len, y = count, 
+                             fill = count >= 30)) +
+  geom_bar(stat = "identity") +
+  facet_grid(gene~species) + 
+  scale_fill_brewer(palette = "Set1") +
+  theme_bw()
+```
+
+Filter by spectratype: at least 30 CDR3s by len+species+gene
+
+```{r}
+spectra.good = dt.vdjdb.spectra %>%
+  filter(count >= 30)
+
+dt.vdjdb.good = dt.vdjdb.good %>%
+  merge(spectra.good %>% select(species, gene, len),
+        by = c("species", "gene", "len"))
+```
+
+## Computing substitutions
+
+Find 1mm CDR3 pairs
+
+```{r}
+comp_hamming_dist = function(s, g, l) {
+  cdrs = dt.vdjdb.good %>%
+    filter(species == s, gene == g, len == l) %>%
+    .$cdr3 %>%
+    unique
+  
+  stringdistmatrix(cdrs, cdrs,
+                      method = "hamming", useNames = T, 
+                      nthread = 80) %>%
+    melt %>%
+    mutate(from = as.character(Var1),
+           to = as.character(Var2)) %>%
+    filter(value == 1) %>% 
+    mutate(species = s, gene = g,
+           substs = value) %>%
+    select(species, gene, from, to) %>%
+    as.data.table
+}
+
+cdr3_pairs = dt.vdjdb.good %>%
+  mutate(x = paste(species, gene, len)) %>%
+  .$x %>%
+  unique %>%
+  strsplit(split = " ") %>%
+  lapply(function(x) comp_hamming_dist(x[1], x[2], x[3])) %>%
+  rbindlist
+```
+
+### Annotate
+
+Symmetrize. Add antigen annotation
+
+```{r}
+cdr3_pairs.ann = cdr3_pairs %>%
+  rbind(cdr3_pairs %>% mutate(tmp = from, from = to, to = tmp) %>%
+          select(species, gene, from, to)) %>%
+  merge(dt.vdjdb.good %>%
+          mutate(ag1 = antigen.epitope, from = cdr3,
+                 v.end.from = v.end, 
+                 j.start.from = j.start) %>%
+          select(species, gene, ag1, from, v.end.from, j.start.from, len) %>%
+          unique %>%
+          as.data.table,
+        by = c("species", "gene", "from"),
+        allow.cartesian = T) %>%
+  merge(dt.vdjdb.good %>%
+          mutate(ag2 = antigen.epitope, to = cdr3,
+                 v.end.to = v.end, 
+                 j.start.to = j.start) %>%
+          select(species, gene, ag2, to, v.end.to, j.start.to) %>%
+          unique %>%
+          as.data.table, 
+        by = c("species", "gene", "to"),
+        allow.cartesian = T)
+```
+
+### Add amino acids
+
+Flatten CDR3s to amino acid tables
+
+```{r}
+cdr.aas = with(cdr3_pairs, c(from, to)) %>%
+  unique %>%
+  strsplit("") %>%
+  mclapply(function(x) data.table(cdr3 = paste0(x, collapse = ""),
+                                  pos = 1:length(x),
+                                  aa = x),
+           mc.cores = 80) %>%
+  rbindlist
+```
+
+Append AAs them to CDR3 data
+
+```{r}
+cdr3_pairs.ann.aa = cdr3_pairs.ann %>%
+  as.data.table %>%
+  merge(cdr.aas %>% mutate(from = cdr3, aa.from = aa) %>% select(from, pos, aa.from),
+        by = "from",
+        allow.cartesian = T) %>%
+  merge(cdr.aas %>% mutate(to = cdr3, aa.to = aa) %>% select(to, pos, aa.to),
+        by = c("to", "pos"),
+        allow.cartesian = T) %>%
+  mutate(same.ag = ag1 == ag2)
+```
+
+### VDJ mapping statistics
+
+```{r}
+vdjmap.s = cdr3_pairs.ann.aa %>%
+  group_by(species, gene, len, pos) %>%
+  summarise(total = n(), 
+            count.v = sum(pos < v.end.from) + 0.5 * sum(pos == v.end.from),
+            count.n = sum(pos > v.end.from & pos < j.start.from) 
+            + 0.5 * sum(pos == v.end.from) + 0.5 * sum(pos == j.start.from),
+            count.j = sum(pos > j.start.from) + 0.5 * sum(pos == j.start.from)) %>%
+  group_by(species, gene, len, pos) %>%
+  mutate(total2 = sum(count.v+count.n+count.j))
+```
+
+```{r}
+ggplot(vdjmap.s %>% 
+         mutate(freq.v = count.v / total2,
+                freq.j = count.j / total2,
+                freq.n = count.n / total2) %>%
+         select(species, gene, len, pos, freq.v, freq.j, freq.n) %>%
+         melt(id.vars = c("species", "gene", "len", "pos")) %>%
+         filter(value > 0),
+       aes(x = pos, y = value, fill = variable, color = variable)) +
+  geom_bar(stat = "identity") +
+  scale_fill_brewer(palette = "Set1") +
+  scale_color_brewer(palette = "Set1") +
+  scale_x_continuous("Position", breaks = seq(0, 20, by = 3)) +
+  facet_grid(species+gene~len, scales = "free_x") +
+  theme_bw()
+```
+
+## Subsitution placement statistics
+
+```{r}
+subst = cdr3_pairs.ann.aa %>%
+  filter(aa.from != aa.to) %>%
+  mutate(same.ag = ag1 == ag2) %>%
+  as.data.table
+```
+
+### Substitutions by region
+
+```{r}
+subst.r = subst %>%
+  mutate(same.ag = ag1 == ag2, 
+         region = ifelse(pos <= v.end.from, "V", ifelse(pos >= j.start.from, "J", "N"))) %>%
+  group_by(species, gene, same.ag) %>%
+  mutate(total = n()) %>%
+  group_by(species, gene, same.ag, region, total) %>%
+  summarise(count = n())
+
+subst.r$region = factor(subst.r$region, levels = c("V", "N", "J"))
+```
+
+```{r}
+ggplot(subst.r, aes(x = region, y = count / total, fill = same.ag, color = same.ag)) +
+  geom_errorbar(aes(ymin = count / total, 
+                    ymax = count / total + 
+                      1.96 * sqrt(count / total * (1-count / total) / total)),
+                position = "dodge") +
+  geom_bar(stat = "identity", position = "dodge") +
+  ylab("Fraction of substitutions") +
+  scale_fill_brewer("Same antigen", palette = "Set1") +
+  scale_color_brewer("Same antigen", palette = "Set1") +
+  facet_grid(gene~species) +
+  theme_bw()
+```
+
+### Positions
+
+Summarise by position
+
+```{r}
+subst.pos = subst %>%
+  mutate(same.ag = ag1 == ag2) %>%
+  group_by(species, gene, same.ag, len, pos) %>%
+  summarise(count = n()) %>%
+  ungroup %>%
+  group_by(species, gene, same.ag, len) %>%
+  mutate(total = sum(count))
+```
+
+Distribution of substitutions
+
+```{r}
+ggplot(vdjmap.s %>% 
+         mutate(freq.v = count.v / total2,
+                freq.j = count.j / total2,
+                freq.n = count.n / total2) %>%
+         select(species, gene, len, pos, freq.v, freq.j, freq.n) %>%
+         melt(id.vars = c("species", "gene", "len", "pos")) %>%
+         filter(value > 0)) +
+  geom_bar(aes(x = pos, y = value, fill = variable, color = variable), stat = "identity") +
+  geom_line(data = subst.pos %>% filter(same.ag == T), aes(x = pos, y = count/total)) +
+  scale_x_continuous("Position", breaks = seq(0, 20, by = 3)) +
+  scale_fill_brewer(palette = "Set1") +
+  scale_color_brewer(palette = "Set1") +
+  facet_grid(species+gene~len, scales = "free_x") +
+  theme_bw()
+```
+
+Figure
+
+```{r}
+library(scales)
+p4=ggplot(vdjmap.s %>% 
+         filter(species != "MacacaMulatta") %>%
+         mutate(V = count.v / total2,
+                J = count.j / total2,
+                N = count.n / total2) %>%
+         select(species, gene, len, pos, V, J, N) %>%
+         melt(id.vars = c("species", "gene", "len", "pos")) %>%
+         filter(value > 0)) +
+  geom_bar(aes(x = pos, y = value, fill = variable, color = variable), stat = "identity") +
+  geom_line(data = subst.pos %>% filter(same.ag == T, species != "MacacaMulatta"),
+            aes(x = pos, y = count/total)) +
+  scale_x_continuous("Position", breaks = c(0,3,6,9,12,15,18)) +
+  scale_y_continuous("Fraction of sequences", labels = percent) +
+  scale_fill_brewer(palette = "Set1") +
+  scale_color_brewer(palette = "Set1") +
+  facet_grid(species+gene~len, scales = "free_x") +
+  theme_bw() +
+  theme(legend.position = "bottom", 
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank(),
+        strip.background = element_blank(),
+        panel.border = element_rect(colour = "black"))
+p4
+pdf("figures/p4.pdf", width = 12, height = 6)
+p4
+dev.off()
+```
+
+## Cluster(block)-based substitution matrix
+
+Generate clusters
+
+```{r}
+get_clusters = function(s, g, ag, l) {
+  dist.tmp = cdr3_pairs.ann %>%
+    filter(species == s, gene == g, ag1 == ag, ag2 == ag, len == l) %>%
+    select(from, to)
+  
+  graph.tmp = graph_from_data_frame(dist.tmp, directed = F)
+  
+  cls.tmp = clusters(graph.tmp)$membership
+  
+  if (length(cls.tmp) == 0) {
+    return(data.table(cluster.id = character(0),
+             cdr3 = character(0),
+             species = character(0), gene = character(0), antigen.epitope = character(0), 
+             len = integer(0)))
+  }
+  data.table(cluster.id = paste0("c", cls.tmp, "_", l),
+             cdr3 = names(cls.tmp),
+             species = s, gene = g, antigen.epitope = ag, 
+             len = l) %>% unique
+}
+
+clusters = dt.vdjdb.good %>%
+  mutate(x = paste(species, gene, antigen.epitope, len)) %>%
+  .$x %>%
+  unique %>%
+  strsplit(split = " ") %>%
+  lapply(function(x) get_clusters(x[1], x[2], x[3], as.integer(x[4]))) %>%
+  rbindlist
+```
+
+Summary on clusters
+
+```{r}
+clusters %>%
+  .$antigen.epitope %>%
+  unique %>% length
+
+clusters %>%
+  .$cdr3 %>%
+  unique %>% length
+
+clusters %>%
+  group_by(cluster.id) %>%
+  summarise(count = n()) %>%
+  .$count %>%
+  summary
+```
+
+Annotate clusters, append AAs
+
+```{r}
+clusters.aa.ann = clusters %>%
+  rbind(clusters2) %>%
+  group_by(species, gene, antigen.epitope, cluster.id) %>%
+  mutate(csize = n()) %>%
+  ungroup %>%
+  merge(cdr.aas, allow.cartesian = T) %>%
+  merge(vdjmap.s %>%
+          mutate(p.n = count.n / total2) %>%
+          select(species, gene, len, pos, p.n),
+        by = c("species", "gene", "len", "pos"))
+```
+
+### Calculating the BLOSUM way
+
+Summarise
+
+```{r}
+clusters.s = clusters.aa.ann %>%
+  group_by(species, gene, antigen.epitope, len, cluster.id, csize, pos, aa, p.n) %>%
+  summarise(count = n()) %>%
+  group_by(species, gene, antigen.epitope, len, cluster.id, csize, pos, p.n) %>%
+  mutate(p = count / sum(count), pmax = max(p)) %>%
+  ungroup
+```
+
+```{r}
+ggplot(clusters.s %>%
+         filter(antigen.epitope != "-") %>%
+         select(species, gene, len, pos, p.n) %>%
+         unique %>%
+         ungroup) +
+  geom_line(aes(x = pos, y = p.n)) +
+  geom_boxplot(data = clusters.s, aes(x = pos, group = pos, y = 1 - pmax), 
+               fill = NA, color = "red") +
+  scale_x_continuous("Position", breaks = seq(0, 20, by = 3)) +
+  ylab("1-max[P(AA)], red / P(N region), black") +
+  facet_grid(species+gene~len, scales = "free_x") +
+  theme_bw()
+```
+
+Summarise - 2
+
+```{r}
+clusters.ss = clusters.s %>%
+  mutate(aa.1 = aa, count.1 = count) %>%
+  select(-aa, -count, -p)
+
+clusters.ss = clusters.ss %>%
+  merge(clusters.ss %>% 
+          mutate(aa.2 = aa.1, count.2 = count.1) %>%
+          select(-aa.1, -count.1))
+
+clusters.ss = clusters.ss %>%
+  group_by(species, gene, antigen.epitope, len, 
+           csize, pmax, p.n, 
+           cluster.id, pos, 
+           aa.1, aa.2) %>%
+  summarise(count = ifelse(aa.1 == aa.2, 
+                           as.numeric(count.1 * (count.1 - 1) / 2), 
+                           as.numeric(count.1 * count.2))) %>%
+  ungroup 
+```
+
+Compute number of substitutions
+
+```{r}
+# here we remove R7 according to https://ac.els-cdn.com/S1074761304003140/1-s2.0-S1074761304003140-main.pdf?_tid=0410bd3e-fcbe-11e7-a733-00000aacb35d&acdnat=1516328050_ad5c09a44d4e6fee72b5f0fbeb4dff1e
+# too much bias otherwise
+
+subst.mat = clusters.ss %>%
+  as.data.frame %>%
+  filter(pmax < 1, !(antigen.epitope == "TTPESANL" & pos == 7)) %>%
+  group_by(same.ag = antigen.epitope != "-") %>%
+  mutate(total = sum(ifelse(aa.1 < aa.2, 0, count * p.n))) %>%
+  group_by(same.ag, aa.1, aa.2, total) %>%
+  summarise(count = sum(count * p.n)) %>%
+  as.data.table
+
+# add pseudocounts
+
+subst.mat.pseudo = with(subst.mat, expand.grid(aa.1 = unique(aa.1),
+                                               aa.2 = unique(aa.2),
+                                               same.ag = c(T, F),
+                                               count = 1)) %>%
+  merge(subst.mat %>% select(same.ag, total) %>% unique)
+subst.mat.pseudo$aa.1 = as.character(subst.mat.pseudo$aa.1)
+subst.mat.pseudo$aa.2 = as.character(subst.mat.pseudo$aa.2)
+subst.mat.pseudo = data.table(subst.mat.pseudo)
+
+subst.mat = rbind(subst.mat, subst.mat.pseudo) %>%
+  as.data.frame %>%
+  group_by(same.ag, aa.1, aa.2) %>%
+  summarise(count = sum(count), p = count / total[1]) %>%
+  ungroup
+
+ggplot(subst.mat, aes(x = aa.1, y = aa.2, fill = log10(p))) +
+  geom_tile() +
+  scale_fill_gradientn(colors=colorRampPalette(rev(brewer.pal(11, 'YlGnBu')))(32)) +
+  facet_wrap(~same.ag) +
+  theme_bw()
+```
+
+Probabilities of individual amino acids and expected probabilities
+
+```{r}
+subst.mat.basefreq = subst.mat %>%
+  group_by(same.ag, aa.1) %>%
+  summarise(p0 = sum(ifelse(aa.2 == aa.1, p, p / 2)))
+
+subst.mat.exp = subst.mat.basefreq %>%
+  merge(subst.mat.basefreq %>% mutate(aa.2 = aa.1, p0x = p0) %>% select(-aa.1, -p0)) %>%
+  group_by(same.ag, aa.1, aa.2) %>%
+  mutate(pexp = ifelse(aa.1 == aa.2, p0 * p0x, 2 * p0 * p0x)) %>%
+  select(same.ag, aa.1, aa.2, pexp)
+```
+
+Scores
+
+```{r}
+subst.mat.scores = subst.mat %>%
+  merge(subst.mat.exp) %>%
+  mutate(score = log(p / pexp) / log(2))
+
+subst.mat.scores2 = subst.mat.scores %>%
+  group_by(aa.1, aa.2) %>%
+  summarise(score = score[which(same.ag)] - score[which(!same.ag)])
+
+ggplot(subst.mat.scores, #%>% filter(aa.1 != "C", aa.2 != "C"), 
+       aes(x = aa.1, y = aa.2, fill = score)) +
+  geom_tile() +
+  geom_text(aes(label = round(score, 1))) +
+  scale_fill_gradientn(guide = F,
+                       colors=colorRampPalette(rev(brewer.pal(11, 'RdYlBu')))(32),
+                       limits = c(-4.5,4.5)) +
+  xlab("") + ylab("") +
+  facet_wrap(~same.ag) +
+  theme_bw()
+
+ggplot(subst.mat.scores2, #%>% filter(aa.1 != "C", aa.2 != "C"), 
+       aes(x = aa.1, y = aa.2, fill = score)) +
+  geom_tile() +
+  geom_text(aes(label = round(score, 1))) +
+  scale_fill_gradientn(guide = F,
+                       colors=colorRampPalette(rev(brewer.pal(11, 'RdYlBu')))(32),
+                       limits = c(-4.5,4.5)) +
+  xlab("") + ylab("") +
+  theme_bw()
+```
+
+Figure
+
+```{r}
+p5=ggplot(subst.mat.scores %>% filter(same.ag == T), 
+       aes(x = aa.1, y = aa.2, fill = score)) +
+  geom_tile() +
+  geom_text(aes(label = round(score, 1)), size = 1.5) +
+  scale_fill_gradientn(guide = F,
+                       colors=colorRampPalette(rev(brewer.pal(11, 'RdYlBu')))(32),
+                       limits = c(-4.5,4.5)) +
+  xlab("") + ylab("") +
+  theme_bw() +
+  theme(aspect = 1)
+p5
+pdf("figures/p5.pdf", width = 4, height = 4)
+p5
+dev.off()
+```
+
+Save scores
+
+```{r}
+subst.mat.scores %>%
+  filter(same.ag == T) %>%
+  select(aa.1, aa.2, score) %>%
+  fwrite("params/vdjam.txt", sep = "\t")
+```
+
+
+### Analyzing scores
+
+```{r}
+mat.scores = subst.mat.scores %>%
+  filter(same.ag == T, 
+         aa.1 != aa.2, 
+         aa.1 != "C" & aa.2 != "C") %>%
+  dcast(aa.1 ~ aa.2, value.var = "score")
+  
+rownames(mat.scores) = mat.scores$aa.1
+mat.scores$aa.1 = NULL
+mat.scores = as.matrix(mat.scores)
+aheatmap(mat.scores)
+```
+
+```{r}
+aadist = subst.mat.scores %>%
+  filter(same.ag == T) %>%
+  dcast(aa.1 ~ aa.2, value.var = "score")
+rownames(aadist) = aadist$aa.1
+aadist$aa.1 = NULL
+aadist = as.matrix(aadist)
+
+mean.silent = mean(subst.mat.scores %>% filter(same.ag == T, aa.1 == aa.2) %>% .$score)
+
+res = isoMDS(1 / (1 + 2^(aadist - mean.silent)),
+             maxit = 500, tol = 1e-4)
+
+aamds = data.table(aa = rownames(res$points),
+                    x = res$points[,1],
+                    y = res$points[,2])
+
+dt.classes = data.table(aa = c("A", "I", "L", "V",
+                               "R", "H", "K",
+                               "C", "M",
+                               "S", "T",
+                               "D", "E",
+                               "N", "Q",
+                               "G", "P", "F", "W", "Y"),
+                        aa.cls = c("aliphatic","aliphatic","aliphatic","aliphatic",
+                                   "basic", "basic", "basic",
+                                   "sulfur","sulfur",
+                                   "hydroxyl", "hydroxyl",
+                                   "acidic", "acidic",
+                                   "amide", "amide",
+                                   "G", "P", "aromatic", "aromatic", "aromatic"))
+
+p6=ggplot(aamds %>% merge(dt.classes), aes(x = x, y = y, color = aa.cls)) +
+  geom_point(size=10) +
+  geom_text(aes(label = aa), color = "black") +
+  scale_color_brewer("AA class", palette = "Set3") +
+  xlab("MDS-1") + ylab("MDS-2") +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank())
+p6
+
+pdf("figures/p6.pdf", width = 6, height = 4)
+p6
+dev.off()
+```
+
+Comparison with BLOSUM62 matrix
+
+```{r}
+blosum62 = fread("params/blosum62.txt") %>%
+  melt()
+
+colnames(blosum62) = c("aa.1", "aa.2", "score_blosum")
+blosum62$aa.1 = as.character(blosum62$aa.1)
+blosum62$aa.2 = as.character(blosum62$aa.2)
+
+blosum62 = blosum62 %>%
+  filter(!(aa.1 %in% c("*", "X", "Z", "B")),
+         !(aa.2 %in% c("*", "X", "Z", "B")))
+
+subst.mat.scores.comp = merge(subst.mat.scores, blosum62, by = c("aa.1", "aa.2"))
+
+p7=ggplot(subst.mat.scores.comp %>%
+         mutate(replacement = ifelse(aa.1 != aa.2, "Replacement", "Silent")),
+       aes(x = score_blosum, y = score)) +
+  geom_boxplot(aes(group = score_blosum)) +
+  facet_wrap(~replacement, scales = "free") +
+  xlab("BLOSUM score") + ylab("VDJAM score") +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank(),
+        strip.background = element_blank(),
+        panel.border = element_rect(colour = "black"))
+
+p7
+pdf("figures/p7.pdf", width = 8, height = 4)
+p7
+dev.off()
+
+summary(lm(score~score_blosum, subst.mat.scores.comp %>% filter(aa.1 == aa.2)))
+summary(lm(score~score_blosum, subst.mat.scores.comp %>% filter(aa.1 != aa.2)))
+
+ggplot(subst.mat.scores.comp %>% 
+         filter(aa.1 != "C", aa.2 != "C") %>%
+         select(aa.1, aa.2, score, score_blosum) %>% 
+         melt %>% group_by(variable) %>%
+         #mutate(value = 2 * (value - min(value)) / (max(value) - min(value)) - 1 ), 
+         mutate(value = scale(value)),
+       aes(x = aa.1, y = aa.2, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors=colorRampPalette(brewer.pal(11, 'RdBu'))(32),
+                       limits = c(-5.5,5.5)) +
+  facet_wrap(~variable) +
+  theme_bw()
+```
+
+## Indels
+
+```{r}
+comp_lv_dist = function(s, g, ag) {
+  cdrs = dt.vdjdb.good %>%
+    filter(species == s, gene == g, antigen.epitope == ag) %>%
+    .$cdr3 %>%
+    unique
+  
+  stringdistmatrix(cdrs, cdrs,
+                   method = "lv", useNames = T, 
+                   nthread = 80) %>%
+    melt %>%
+    mutate(from = as.character(Var1),
+           to = as.character(Var2)) %>%
+    filter(value == 1, abs(nchar(from) - nchar(to)) == 1) %>% 
+    mutate(species = s, gene = g) %>%
+    select(species, gene, from, to) %>%
+    as.data.table
+}
+
+cdr3_indel_pairs = dt.vdjdb.good %>%
+  mutate(x = paste(species, gene, antigen.epitope)) %>%
+  .$x %>%
+  unique %>%
+  strsplit(split = " ") %>%
+  lapply(function(x) comp_lv_dist(x[1], x[2], x[3])) %>%
+  rbindlist
+```
+
+Perform alignments
+
+```{r}
+aln_fun = function(a, b) {
+  aln = pairwiseAlignment(a, b)
+  from = as.character(subject(aln))
+  to = as.character(pattern(aln))
+  
+  data.table(from = from,
+             to = to,
+             aa.from = strsplit(from, "")[[1]], 
+             aa.to = strsplit(to, "")[[1]])
+}
+
+cdr3_indel_pairs_aln = cdr3_indel_pairs %>%
+  mutate(x = paste(from, to)) %>%
+  .$x %>%
+  unique %>%
+  strsplit(split = " ") %>%
+  mclapply(function(x) aln_fun(x[1], x[2]), mc.cores = 80) %>%
+  rbindlist
+```
+
+```{r}
+indels.s = cdr3_indel_pairs_aln %>%
+  as.data.frame %>%
+  filter(aa.from == "-" | aa.to == "-") %>%
+  group_by(aa = ifelse(aa.from == "-", aa.to, aa.from)) %>%
+  summarise(count = n()) %>%
+  ungroup %>%
+  mutate(freq = count / sum(count)) %>%
+  merge(subst.mat.scores %>%
+          filter(aa.1 == aa.2, same.ag == T) %>%
+          mutate(aa = aa.1) %>%
+          select(aa, score) %>%
+          unique, by = "aa")
+
+## Freq
+p8=ggplot(indels.s, aes(x = log2(freq), y = score)) +
+  geom_smooth(method = "lm", linetype = "dashed") +
+  geom_point() +
+  xlab("Log2 Indel frequency") + ylab("VDJAM score") +
+  theme_bw() +
+  theme(aspect = 1,
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank())
+
+p8
+pdf("figures/p8.pdf", width = 4, height = 4)
+p8
+dev.off()
+
+summary(lm(log2(freq) ~ score, indels.s))
+```

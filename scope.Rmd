@@ -1,0 +1,442 @@
+---
+title: "Search Scope Analysis (levenstein distance thresholds)"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+library(parallel)
+library(stringdist)
+library(stringr)
+library(ineq)
+library(igraph)
+library(NMF)
+library(MASS)
+library(scales)
+select = dplyr::select
+```
+
+## Preprocessing
+
+Load data
+ 
+```{r}
+dt.vdjdb = fread("vdjdb.txt") %>%
+  select(species, antigen.epitope, gene, cdr3) %>%
+  unique %>%
+  filter(nchar(cdr3) >= 7, 
+         startsWith(cdr3, "C"), endsWith(cdr3, "F") | endsWith(cdr3, "W"))
+```
+
+Count per AG
+
+```{r}
+dt.epi.count = dt.vdjdb %>%
+  group_by(species, antigen.epitope, gene) %>%
+  summarise(count = length(unique(cdr3))) %>%
+  arrange(-count)
+
+print(dt.epi.count)
+```
+
+Require at least 50 TCRs per epitope
+
+```{r}
+epi.good = dt.epi.count %>%
+  filter(count >= 50) %>%
+  select(species, gene, antigen.epitope)
+
+dt.vdjdb.good = dt.vdjdb %>%
+  merge(epi.good)
+```
+
+## Applying different search scopes
+
+Compute levenstein distances
+
+```{r}
+get_dist_lv = function(s, g) {
+  cdrs = dt.vdjdb.good %>%
+    filter(species == s, gene == g) %>%
+    .$cdr3 %>%
+    unique
+  
+  stringdistmatrix(cdrs, cdrs,
+                      method = "lv", useNames = T, 
+                      nthread = 80) %>%
+    melt %>%
+    mutate(from = as.character(Var1),
+           to = as.character(Var2)) %>%
+    filter(from != to, value > 0, value <= 7) %>% 
+    mutate(species = s, gene = g,
+           indels = abs(nchar(from) - nchar(to)), substs = value - indels) %>%
+    select(species, gene, from, to, indels, substs)
+}
+
+vars = dt.vdjdb.good %>%
+  select(species, gene) %>%
+  unique
+vars = with(vars, paste(species, gene))
+
+pwise_dist = strsplit(vars, split = " ") %>%
+  lapply(function(x) get_dist_lv(x[1], x[2])) %>%
+  rbindlist
+```
+
+Add various info
+
+```{r}
+pwise_dist_ann = pwise_dist %>%
+  merge(dt.vdjdb.good %>% 
+          mutate(from = cdr3, ag1 = antigen.epitope) %>% 
+          select(species, gene, from, ag1) %>%
+          unique %>% as.data.table, by = c("species", "gene", "from"), allow.cartesian = T) %>%
+  merge(dt.vdjdb.good %>% 
+          mutate(to = cdr3, ag2 = antigen.epitope) %>% 
+          select(species, gene, to, ag2) %>%
+          unique %>% as.data.table, by = c("species", "gene", "to"), allow.cartesian = T) %>%
+  mutate(min.len = pmin(nchar(from), nchar(to)))
+```
+
+## Search scope size
+
+```{r}
+scope_sz = pwise_dist_ann %>%
+  group_by(species, gene, from, indels, substs) %>%
+  summarise(count = n())
+
+scope_sz = scope_sz %>%
+  as.data.frame %>%
+  merge(expand.grid(indels.c = 0:7, substs.c = 0:7) %>%
+          filter(indels.c + substs.c > 0, indels.c + substs.c <= 7) %>%
+          as.data.table) %>%
+  group_by(species, gene, from, indels.c, substs.c) %>%
+  summarise(count = sum(ifelse(indels <= indels.c & substs <= substs.c, count, 0)))
+```
+
+```{r}
+total_cdrs = scope_sz %>%
+  group_by(species, gene) %>%
+  summarise(total_cdrs = length(unique(from)))
+
+scope_sz.s = scope_sz %>%
+  group_by(species, gene, len = nchar(from), indels.c, substs.c) %>%
+  summarise(count = mean(count)) %>%
+  merge(total_cdrs)
+```
+
+```{r}
+ggplot(scope_sz.s %>% filter(len > 8, len < 20), 
+       aes(x = substs.c, y = indels.c, fill = log10(count / total_cdrs))) +
+  #geom_tile() +
+  geom_point(aes(size = count / total_cdrs), shape = 21, color = "black") +
+  #geom_text(aes(label = paste0(round(100*count / total_cdrs, 0), "%"))) +
+  #geom_tile(aes(x=3, y=2), color = "black", fill = "NA") +
+  scale_fill_gradientn(guide = F,
+                       colors=colorRampPalette(rev(brewer.pal(11, 'RdGy')))(32)) +
+  scale_size_continuous("Fraction matched", labels = percent) +
+  scale_x_continuous("#substitutions", breaks = 0:7) +
+  scale_y_continuous("#indels", breaks = 0:7) +
+  facet_grid(species+gene~len) +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank())
+```
+
+```{r}
+scope_sz.s2 = scope_sz %>%
+  group_by(species, gene, indels.c, substs.c) %>%
+  summarise(count = mean(count)) %>%
+  merge(total_cdrs)
+
+ggplot(scope_sz.s2, 
+       aes(x = substs.c, y = indels.c, fill = log10(count / total_cdrs))) +
+  geom_tile() +
+  #geom_point(aes(size = count / total_cdrs), shape = 21, color = "black") +
+  geom_text(aes(label = paste0(round(100*count / total_cdrs, 2), "%"))) +
+  #geom_tile(aes(x=3, y=2), color = "black", fill = "NA") +
+  scale_fill_gradientn("Log10 fraction matched",
+                       colors=colorRampPalette(rev(brewer.pal(11, 'RdGy')))(32)) +
+  scale_x_continuous("#substitutions", breaks = 0:7) +
+  scale_y_continuous("#indels", breaks = 0:7) +
+  facet_grid(species~gene) +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank())
+```
+
+## Accuracy analysis
+
+Summarise
+
+```{r}
+pwise_dist_s = pwise_dist_ann %>%
+  group_by(species, gene, indels, substs, ag1, ag2) %>%
+  summarise(count = n())
+```
+
+Number of possible comparisons
+
+```{r}
+vdjdb.s = dt.vdjdb.good %>%
+  group_by(species, gene, antigen.epitope) %>%
+  summarise(total = n())
+```
+
+Cumulative stats
+
+```{r}
+vars2 = pwise_dist_s %>%
+  select(species, gene, ag1, ag2) %>%
+  unique %>%
+  as.data.frame %>%
+  merge(expand.grid(indels.c = 0:7, substs.c = 0:7) %>%
+          filter(indels.c + substs.c > 0, indels.c + substs.c <= 7)) %>%
+  ungroup %>%
+  as.data.table
+
+pwise_dist_cums = pwise_dist_s %>%
+  merge(vars2) %>%
+  group_by(species, gene, ag1, ag2, indels.c, substs.c) %>%
+  summarise(count = sum(ifelse(indels <= indels.c & substs <= substs.c, count, 0))) %>%
+  ungroup %>%
+  as.data.frame %>%
+  merge(vdjdb.s %>%
+          mutate(ag1 = antigen.epitope, total1 = total) %>%
+          select(-antigen.epitope, -total)) %>%
+  merge(vdjdb.s %>%
+          mutate(ag2 = antigen.epitope, total2 = total) %>%
+          select(-antigen.epitope, -total)) %>%
+  mutate(same.ag = ag1 == ag2,
+         p = ifelse(same.ag, count / total1 / (total1 - 1), count / total1 / total2))
+```
+
+```{r}
+ggplot(pwise_dist_cums, aes(x = same.ag, group = same.ag, y = p)) +
+  geom_boxplot() +
+  facet_grid(species+gene~substs.c+indels.c) +
+  theme_bw()
+```
+
+```{r}
+pwise_dist_cumss = pwise_dist_cums %>%
+  group_by(species, gene, substs.c, indels.c, ag = ifelse(same.ag, "same", "different")) %>%
+  summarise(p = mean(p))
+```
+
+```{r}
+pwise_dist_cumss.ratio = pwise_dist_cumss %>%
+  group_by(species, gene, substs.c, indels.c) %>%
+  summarise(p_ratio = p[which(ag == "same")] / p[which(ag != "same")])
+
+ggplot(pwise_dist_cumss.ratio, 
+       aes(x = substs.c, y = indels.c, fill = log10(p_ratio))) +
+  geom_tile() +
+  #geom_point(aes(size = count / total_cdrs), shape = 21, color = "black") +
+  geom_text(aes(label = round(p_ratio, 1))) +
+  #geom_tile(aes(x=3, y=2), color = "black", fill = "NA") +
+  scale_fill_gradientn("Same:different AG matches",
+                       colors=colorRampPalette(brewer.pal(11, 'YlOrRd'))(32)) +
+  scale_x_continuous("#substitutions", breaks = 0:7) +
+  scale_y_continuous("#indels", breaks = 0:7) +
+  facet_grid(species~gene) +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank())
+```
+
+### Precision and recall curves
+
+```{r}
+ggplot(pwise_dist_cumss, 
+       aes(x = substs.c, y = p, color = as.factor(indels.c), linetype = ag)) +
+  geom_line() +
+  scale_y_log10(labels = percent) +
+  facet_grid(species~gene) +
+  theme_bw()
+```
+
+```{r}
+pwise_dist_cumss2 = pwise_dist_cums %>%
+  group_by(species, gene, substs.c, indels.c, ag1, ag2) %>%
+  summarise(count = sum(count), total = ifelse(ag1 == ag2,
+                                               total1[1] * (total1[1] - 1), 
+                                               total1[1] * total2[1])) %>%
+  group_by(species, gene, substs.c, indels.c, type = ifelse(ag1 == ag2, "positive", "negative")) %>%
+  summarise(count = sum(count), total = sum(total))
+```
+
+```{r}
+pwise_dist_cumss2_stats = pwise_dist_cumss2 %>%
+  group_by(species, gene, substs.c, indels.c) %>%
+  summarise(TP = count[which(type == "positive")],
+            FP = count[which(type == "negative")],
+            TN = total[which(type == "negative")] - count[which(type == "negative")],
+            FN = total[which(type == "positive")] - count[which(type == "positive")])
+```
+
+```{r}
+ggplot(pwise_dist_cumss2_stats, 
+       aes(x = substs.c, 
+           color = as.factor(indels.c))) +
+  geom_line(aes(y = TP / (TP + FP)), size = 1) +
+  geom_point(aes(y = TP / (TP + FP)), shape = "o", size = 5) +
+  geom_line(aes(y = TP / (TP + FN)), linetype = "dashed", size = 1) +
+  geom_point(aes(y = TP / (TP + FN)), shape = "+", size = 5) +
+  scale_y_continuous("Precision (solid) / Recall (dashed)", labels = percent) +
+  scale_x_continuous("# substitutions", breaks = 0:10) +
+  scale_color_discrete("# indels") +
+  facet_grid(species~gene) +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank())
+```
+
+## More practical metrics
+
+### Recall
+
+Probability of getting 0 hits for an epitope represented by X records in VDJdb
+
+```{r}
+recall_prob = pwise_dist_cums %>%
+  filter(same.ag) %>%
+  select(species, gene, indels.c, substs.c, ag1, p) %>%
+  merge(data.table(total = c(10, 30, 50, 100, 500, 1000))) %>%
+  mutate(P_recall = 1-exp(-total*p))
+
+ggplot(recall_prob, aes(x = as.factor(total), group=total, y = P_recall)) +
+  geom_boxplot() +
+  facet_grid(indels.c~substs.c)
+```
+
+Average across epitopes
+
+```{R}
+recall_prob.s = recall_prob %>%
+  group_by(species, gene, indels.c, substs.c, total) %>%
+  summarise(P_recall = mean(P_recall))
+
+p1=ggplot(recall_prob.s %>%
+         filter(species != "MacacaMulatta"), 
+       aes(x = substs.c, y = indels.c, fill = P_recall)) +
+  geom_tile() +
+  geom_text(aes(label = round(P_recall, 1)), size = 2) +
+  geom_tile(aes(x=3,y=2), color = "black", fill = "NA", size=0.2) +
+  scale_fill_gradientn(guide = F,
+                       colors=colorRampPalette(brewer.pal(11, 'RdYlGn'))(32)) +
+  scale_x_continuous("#substitutions", breaks = 0:7) +
+  scale_y_continuous("#indels", breaks = 0:7) +
+  facet_grid(species+gene~total) +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank(),
+        strip.background = element_blank(),
+        panel.border = element_rect(colour = "black"))
+
+p1
+pdf("figures/p1.pdf", width = 8, height = 4)
+p1
+dev.off()
+```
+
+### Precision
+
+Square root of the number of pairs with same and different antigens, averaged across all antigen combinations
+
+```{r}
+pair_count = pwise_dist_cums %>%
+  group_by(indels.c, substs.c, same.ag, species, gene) %>%
+  summarise(n_pairs = sum(count))
+
+p2=ggplot(pair_count %>%
+         filter(species != "MacacaMulatta") %>%
+           mutate(ag = ifelse(same.ag, "Same AG", "Different AG")), 
+       aes(x = substs.c, y = indels.c, fill = log10(n_pairs))) +
+  geom_tile() +
+  #geom_text(aes(label = round(log10(n_pairs), 1)), size = 2) +
+  geom_text(aes(label = format(n_pairs, scientific = T, digits = 1)), size = 1) +
+  geom_tile(aes(x=3,y=2), color = "black", fill = "NA", size=0.2) +
+  scale_x_continuous("#substitutions", breaks = 0:7) +
+  scale_y_continuous("#indels", breaks = 0:7) +
+  scale_fill_gradientn(guide = F, #"Log10 #pairs",
+                       colors=colorRampPalette(brewer.pal(5, 'YlOrRd'))(32)) +
+  facet_grid(ag~species+gene) +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank(),
+        strip.background = element_blank(),
+        panel.border = element_rect(colour = "black"))
+
+p2
+
+pdf("figures/p2.pdf", width = 6, height = 4)
+p2
+dev.off()
+```
+
+Odds ratio of same:different matches
+
+```{r}
+p3=ggplot(pwise_dist_cumss.ratio %>%
+         filter(species != "MacacaMulatta"), 
+       aes(x = substs.c, y = indels.c, fill = log10(p_ratio))) +
+  geom_tile() +
+  geom_text(aes(label = round(p_ratio, 1)), size = 2) +
+  geom_tile(aes(x=3,y=2), color = "black", fill = "NA", size=0.2) +
+  scale_fill_gradientn(guide = F, #"Log10 OR",
+                       colors=colorRampPalette(brewer.pal(5, 'YlOrRd'))(32)) +
+  scale_x_continuous("#substitutions", breaks = 0:7) +
+  scale_y_continuous("#indels", breaks = 0:7) +
+  facet_grid(.~species+gene) +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank(),
+        strip.background = element_blank(),
+        panel.border = element_rect(colour = "black"))
+
+p3
+pdf("figures/p3.pdf", width = 6, height = 2)
+p3
+dev.off()
+```
+
+
+Probability of finding non-existent specificity in a repertoire
+
+```{r}
+prec_prob.s = pwise_dist_cums %>%
+  mutate(same.ag = ifelse(same.ag, "same", "different")) %>%
+  group_by(species, gene, indels.c, substs.c, ag1, same.ag) %>%
+  summarise(p = mean(p)) %>%
+  dcast(species + gene + indels.c + substs.c + ag1 ~ same.ag) %>%
+  merge(data.table(total = c(30, 50, 100, 500, 30, 50, 100, 500),
+                   total_o = c(300, 500, 1000, 5000, 3000, 5000, 10000, 50000))) %>%
+  group_by(species, gene, indels.c, substs.c, total, total_o) %>%
+  summarise(p = mean(exp(-total*same) * (1-exp(-total_o*different))))
+
+ggplot(prec_prob.s, aes(x = substs.c, y = indels.c, fill = p)) +
+  geom_tile() +
+  geom_text(aes(label = round(p, 1))) +
+  geom_tile(aes(x=3, y=2), color = "black", fill = "NA") +
+  scale_fill_gradientn(guide = F,
+                       colors=colorRampPalette(rev(brewer.pal(11, 'RdYlGn')))(32)) +
+  scale_x_continuous("#substitutions", breaks = 0:7) +
+  scale_y_continuous("#indels", breaks = 0:7) +
+  facet_grid(species+gene~total+total_o) +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank())
+```
+
+### Output
+
+Write pairs with selected scope
+
+```{r}
+pairs_out = pwise_dist %>% filter(substs <= 3, indels <= 2)
+save(pairs_out, file = "cache/pairs.Rda")
+```
+

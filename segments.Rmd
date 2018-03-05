@@ -1,0 +1,368 @@
+---
+title: "Untitled"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(Biostrings)
+library(parallel)
+library(data.table)
+library(dplyr)
+library(reshape2)
+library(stringr)
+library(scales)
+library(ggplot2)
+library(RColorBrewer)
+select = dplyr::select 
+```
+
+Load V segments
+
+```{r}
+df.v = fread("segm/251117.cdr12.txt") %>%
+  filter(grepl("*", seqaa, fixed = T) == F) %>%
+  mutate(segment = "V", id = gene, gene = substr(gene, 1, 3)) %>%
+  select(segment, species, gene, id, seqaa, cdr1aa, cdr2aa) %>%
+  filter(gene %in% c("TRA", "TRB")) %>%
+  mutate(seqaa = gsub("C[^C]*$", "", seqaa)) # trim last C and V CDR3
+
+df.v = df.v %>% mutate(region = "full") %>% select(-cdr1aa, -cdr2aa) %>%
+  rbind(df.v %>% mutate(region = "cdr1", seqaa = cdr1aa) %>% select(-cdr1aa, -cdr2aa)) %>%
+  rbind(df.v %>% mutate(region = "cdr2", seqaa = cdr2aa) %>% select(-cdr1aa, -cdr2aa))
+```
+
+Load J segments, translate after reference point, concat with corresponding 
+
+```{r}
+df.j = fread("segm/joining.txt") %>%
+  as.data.frame %>%
+  mutate(region = "full", segment = "J", id = gene, gene = substr(gene, 1, 3),
+         seqnt = substr(seq, reference_point + 2, nchar(seq)),
+         seqaa = seqnt %>% lapply(function(x) as.character(translate(DNAString(x)))) %>% unlist,
+         c.id = ifelse(gene == "TRA", "TRAC", paste0("TRBC", substr(id, 5, 5)))) %>%
+  select(region, segment, species, gene, id, seqaa, c.id) %>%
+  merge(fread("segm/constant.txt")) %>%
+  mutate(seqaa = paste0(seqaa, c.seq)) %>%
+  select(-c.id, -c.seq)
+
+df.segm = rbind(df.v, df.j)
+```
+
+All combinations
+
+```{r}
+df.segm.comb = df.segm %>% mutate(id.1 = id, seqaa.1 = seqaa) %>% select(-id, -seqaa) %>%
+  merge(df.segm %>% mutate(id.2 = id, seqaa.2 = seqaa) %>% select(-id, -seqaa),
+        allow.cartesian=T)
+```
+
+Compute distances
+
+```{r}
+vdjam = fread("params/vdjam.txt")
+data(BLOSUM62)
+aln_mat = BLOSUM62 %>%
+  melt
+colnames(aln_mat) = c("aa.1", "aa.2", "x")
+
+aln_mat = aln_mat %>%
+  merge(vdjam %>% select(aa.1, aa.2, score), all.x=T) %>%
+  mutate(score = ifelse(is.na(score), ifelse(aa.1 == aa.2, 1, -1), score)) %>%
+  select(-x) %>%
+  dcast(aa.1 ~ aa.2)
+rownames(aln_mat) = aln_mat$aa.1
+aln_mat$aa.1 = NULL
+aln_mat = as.matrix(aln_mat)
+GAP_OFFSET = round(max(abs(max(aln_mat)), abs(min(aln_mat)))) + 2
+
+aln_fun = function(a, b, r) {
+  if (r == "full") {
+    # Default alignment
+    return(pairwiseAlignment(AAString(a), AAString(b),
+                             substitutionMatrix = "BLOSUM62",
+                             scoreOnly=T))
+  } else {
+    # a-la CDR3 alignment
+    s = pairwiseAlignment(AAString(a), AAString(b),
+                          substitutionMatrix = aln_mat,
+                          gapOpening = GAP_OFFSET, gapExtension = GAP_OFFSET,
+                          scoreOnly=T)
+    print(s)
+    s1 = pairwiseAlignment(AAString(a), AAString(a),
+                           substitutionMatrix = aln_mat,
+                           gapOpening = GAP_OFFSET, gapExtension = GAP_OFFSET,
+                           scoreOnly=T)
+    s2 = pairwiseAlignment(AAString(b), AAString(b),
+                           substitutionMatrix = aln_mat,
+                           gapOpening = GAP_OFFSET, gapExtension = GAP_OFFSET,
+                           scoreOnly=T)
+    indels = abs(nchar(a) - nchar(b))
+    return(s + GAP_OFFSET * indels - max(s1, s2))
+  }
+}
+
+df.segm.comb$score = with(df.segm.comb,
+                          mcmapply(function(a, b, r) aln_fun(a, b, r),
+                              seqaa.1, seqaa.2, region,
+                              mc.cores = 80))
+```
+
+Normalize distances
+
+```{r}
+df.segm.comb = df.segm.comb %>%
+  group_by(region, segment, species, gene) %>%
+  mutate(score.s = sum(score)) %>%
+  group_by(region, segment, species, gene, id.1) %>%
+  mutate(score.s1 = sum(score), score.m1 = score[which(id.2 == id.1)]) %>%
+  group_by(region, segment, species, gene, id.2) %>%
+  mutate(score.s2 = sum(score), score.m2 = score[which(id.2 == id.1)]) %>%
+  ungroup %>%
+  mutate(score.norm.m = score - pmax(score.m1, score.m2),
+         score.norm.s = score * score.s / score.s1 / score.s2)
+```
+
+```{r fig.width=24, fig.height=20}
+ggplot(df.segm.comb %>% filter(region == "cdr1", segment == "V"), 
+       aes(x=gsub("TR", "", str_split_fixed(id.1, fixed("*"), 2)[,1]), 
+           y=gsub("TR", "", str_split_fixed(id.2, fixed("*"), 2)[,1]), 
+           fill = score.norm.m)) +
+  geom_tile() +
+  facet_wrap(species ~ gene, scales = "free") +
+  xlab("") + ylab("") +
+  scale_fill_gradientn("Score",
+                       colors=colorRampPalette(rev(brewer.pal(11, 'RdYlBu')))(32)) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+
+ggplot(df.segm.comb %>% filter(region == "cdr2", segment == "V"), 
+       aes(x=gsub("TR", "", str_split_fixed(id.1, fixed("*"), 2)[,1]), 
+           y=gsub("TR", "", str_split_fixed(id.2, fixed("*"), 2)[,1]), 
+           fill = score.norm.m)) +
+  geom_tile() +
+  facet_wrap(species ~ gene, scales = "free") +
+  xlab("") + ylab("") +
+  scale_fill_gradientn("Score",
+                       colors=colorRampPalette(rev(brewer.pal(11, 'RdYlBu')))(32)) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+
+ggplot(df.segm.comb %>% filter(region == "full", segment == "V"), 
+       aes(x=gsub("TR", "", str_split_fixed(id.1, fixed("*"), 2)[,1]), 
+           y=gsub("TR", "", str_split_fixed(id.2, fixed("*"), 2)[,1]), 
+           fill = score.norm.m)) +
+  geom_tile() +
+  facet_wrap(species ~ gene, scales = "free") +
+  xlab("") + ylab("") +
+  scale_fill_gradientn("Score",
+                       colors=colorRampPalette(rev(brewer.pal(11, 'RdYlBu')))(32)) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+
+ggplot(df.segm.comb %>% filter(segment == "J"), 
+       aes(x=gsub("TR", "", str_split_fixed(id.1, fixed("*"), 2)[,1]), 
+           y=gsub("TR", "", str_split_fixed(id.2, fixed("*"), 2)[,1]), 
+           fill = score.norm.m)) +
+  geom_tile() +
+  facet_wrap(species ~ gene, scales = "free") +
+  xlab("") + ylab("") +
+  scale_fill_gradientn("Score",
+                       colors=colorRampPalette(rev(brewer.pal(11, 'RdYlBu')))(32)) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+```
+
+```{r}
+p9=ggplot(df.segm.comb %>% filter(region == "full", segment == "V", species != "MacacaMulatta") %>%
+            mutate(gene = paste(species, gene)), 
+       aes(x=gsub("TR", "", str_split_fixed(id.1, fixed("*"), 2)[,1]), 
+           y=gsub("TR", "", str_split_fixed(id.2, fixed("*"), 2)[,1]), 
+           fill = score.norm.m)) +
+  geom_tile() +
+  facet_wrap( ~ gene, scales = "free") +
+  xlab("") + ylab("") +
+  scale_fill_gradientn("Score",
+                       colors=colorRampPalette(rev(brewer.pal(11, 'RdYlBu')))(32)) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, family = "mono"),
+        axis.text.y = element_text(family = "mono"),
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank(),
+        strip.background = element_blank(),
+        panel.border = element_rect(colour = "black"))
+p9
+pdf("figures/p9.pdf", width=24, height=20)
+p9
+dev.off()
+```
+
+```{r}
+df.out = df.segm.comb %>% mutate(segm.score = score.norm.m) %>% 
+  select(region, species, gene, segment, id.1, id.2, segm.score) %>%
+  dcast(species + gene + segment + id.1 + id.2 ~ region)
+
+colnames(df.out) = c("species", "gene", "segment", "id.1", "id.2",
+                     "cdr1.score", "cdr2.score", "segm.score")
+
+fwrite(df.out, "params/segm_score.txt", sep = "\t")
+```
+
+## Testing scoring
+
+Load data
+
+```{r}
+dt.vdjdb = fread("vdjdb.txt") %>%
+  select(species, antigen.epitope, gene, v.segm, j.segm, cdr3) %>%
+  unique %>%
+  filter(startsWith(cdr3, "C"), endsWith(cdr3, "F") | endsWith(cdr3, "W"),
+         v.segm != "", j.segm != "")
+
+dt.epi.count = dt.vdjdb %>%
+  group_by(species, antigen.epitope, gene) %>%
+  summarise(count = length(unique(cdr3))) %>%
+  arrange(-count)
+
+print(dt.epi.count)
+
+epi.good = dt.epi.count %>%
+  filter(count >= 30) %>%
+  select(species, gene, antigen.epitope)
+
+dt.vdjdb.good = dt.vdjdb %>%
+  merge(epi.good)
+```
+
+### Simple V matching
+
+```{r}
+dt.vdjdb.segm = dt.vdjdb.good %>%
+  select(species, antigen.epitope, gene, v.segm, j.segm) %>%
+  melt(measure.vars = c("v.segm", "j.segm")) %>%
+  mutate(segment = ifelse(variable == "v.segm", "V", "J"), id = value) %>%
+  group_by(species, antigen.epitope, gene, segment, id) %>%
+  summarise(count = n()) %>%
+  as.data.table
+```
+
+```{r}
+dt.vdjdb.matches = (dt.vdjdb.segm %>%
+  select(segment, species, gene, antigen.epitope) %>%
+  unique %>% mutate(ag1 = antigen.epitope) %>% select(-antigen.epitope) %>%
+  merge(dt.vdjdb.segm %>%
+          select(segment, species, gene, antigen.epitope) %>%
+          unique %>% mutate(ag2 = antigen.epitope) %>% select(-antigen.epitope), allow.cartesian=T)) %>%
+  merge(dt.vdjdb.segm %>% mutate(ag1 = antigen.epitope, id.1 = id, count.1 = count) %>%
+          select(-antigen.epitope, -id, -count), 
+        by = c("segment", "species", "gene", "ag1"),
+        allow.cartesian = T) %>%
+  merge(dt.vdjdb.segm %>% mutate(ag2 = antigen.epitope, id.2 = id, count.2 = count) %>%
+          select(-antigen.epitope, -id, -count),
+        by = c("segment", "species", "gene", "ag2"),
+        allow.cartesian = T)
+```
+
+```{r}
+dt.vdjdb.matches = dt.vdjdb.matches %>%
+  group_by(species, gene) %>%
+  mutate(pairs = ifelse(ag1 == ag2 & id.1 == id.2, count.1 * (count.1 - 1), count.1 * count.2))
+```
+
+```{r}
+dt.vdjdb.matches.s = dt.vdjdb.matches %>%
+  group_by(segment, species, gene, ag1, ag2) %>%
+  summarise(comparisons = sum(pairs),
+            matches = sum((id.1 == id.2) * pairs))
+```
+
+```{r}
+p10=ggplot(dt.vdjdb.matches.s %>%
+         filter(species != "MacacaMulatta") %>%
+         ungroup %>%
+         mutate(same.ag = ifelse(ag1 == ag2, "same", "different"),
+                segment = paste0(gene, segment)), 
+       aes(x = same.ag, group = same.ag, y = matches / comparisons)) +
+  geom_boxplot(width = 0.3) +
+  xlab("Antigens") + scale_y_continuous("Comparisons with matched segment", labels = percent,
+                                       limits = c(0,1)) +
+  facet_grid(species~segment, scales = "free_y") +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank(),
+        strip.background = element_blank(),
+        panel.border = element_rect(colour = "black"))
+
+p10
+
+pdf("figures/p10.pdf", width=6, height=4)
+p10
+dev.off()
+
+a = aov(matches / comparisons ~ same.ag + species + gene + segment, dt.vdjdb.matches.s %>% 
+          filter(species != "MacacaMulatta") %>%
+          mutate(same.ag = ifelse(ag1 == ag2, "same", "different")))
+summary(a)
+TukeyHSD(a, "same.ag")
+TukeyHSD(a, "species")
+TukeyHSD(a, "gene")
+TukeyHSD(a, "segment")
+```
+
+### Matching with alignment scores
+
+```{r}
+dt.vdjdb.matches.ss = dt.vdjdb.matches %>%
+  ungroup %>%
+  as.data.table %>%
+  merge(df.segm.comb %>% select(region, segment, species, gene, id.1, id.2, score.norm.m),
+        allow.cartesian = T,
+        by = c("species", "gene", "segment", "id.1", "id.2")) %>%
+  filter(id.1 != id.2) %>%
+  group_by(region, segment, species, gene, ag1, ag2) %>%
+  summarise(comparisons = sum(pairs),
+            matches.s = sum(as.numeric(score.norm.m) * pairs))
+```
+
+```{r}
+dt.vdjdb.matches.ss.ks =dt.vdjdb.matches.ss  %>%
+  ungroup %>%
+  filter(species != "MacacaMulatta") %>%
+  mutate(same.ag = ifelse(ag1 == ag2, "same", "different"),
+         score = matches.s / comparisons) %>%
+  group_by(gene, segment, region) %>%
+  mutate(sm = max(score)) %>%
+  group_by(species, gene, segment, region, sm) %>%
+  summarise(D = ks.test(score[which(ag1 == ag2)], score[which(ag1 != ag2)])$statistic,
+            P = ks.test(score[which(ag1 == ag2)], score[which(ag1 != ag2)])$p) %>%
+  ungroup %>%
+  mutate(segment = paste(paste0(gene, segment), region))
+
+p11=ggplot(dt.vdjdb.matches.ss %>%
+         ungroup %>%
+         filter(species != "MacacaMulatta") %>%
+         mutate(same.ag = ifelse(ag1 == ag2, "same", "different"),
+                segment = paste(paste0(gene, segment), region))) +
+  stat_ecdf(aes(x = matches.s / comparisons, color = same.ag)) +
+  geom_text(data = dt.vdjdb.matches.ss.ks,
+            aes(x = sm, y = 0, label = paste0("P=", signif(P,1), ", D=", signif(D,1))),
+            hjust=1, size=2) +
+  xlab("Segment alignment score") + ylab("CDF") +
+  scale_color_brewer("Antigens", palette = "Set1") +
+  facet_grid(species~segment, scales = "free_x") +
+  theme_bw() +
+  theme(legend.position = "bottom",
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank(),
+        strip.background = element_blank(),
+        panel.border = element_rect(colour = "black"))
+
+p11
+
+pdf("figures/p11.pdf", width=10, height=5)
+p11
+dev.off()
+```

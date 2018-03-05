@@ -1,0 +1,972 @@
+---
+title: "Designing and testing TCR matching metric"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+library(parallel)
+library(stringdist)
+library(stringr)
+library(nloptr)
+library(Biostrings)
+library(pROC)
+library(PRROC)
+library(RColorBrewer)
+library(scales)
+select = dplyr::select
+```
+
+## Preprocessing
+
+Load data and filter it
+ 
+```{r}
+dt.vdjdb = fread("vdjdb.txt") %>%
+  select(species, antigen.epitope, gene, v.segm, j.segm, cdr3) %>%
+  unique %>%
+  filter(species != "MacacaMulatta", # only 3 epitopes
+         nchar(cdr3) > 7, v.segm != "", j.segm != "",
+         startsWith(cdr3, "C"), endsWith(cdr3, "F") | endsWith(cdr3, "W"))
+
+# remove cross-reactive cdr3s
+cdr3.good = dt.vdjdb %>%
+  group_by(cdr3) %>%
+  summarise(nepi = length(unique(antigen.epitope))) %>%
+  filter(nepi == 1) %>%
+  .$cdr3
+
+dt.vdjdb = dt.vdjdb %>%
+  filter(cdr3 %in% cdr3.good)
+
+# select epitopes with >= 30 cdr3s
+dt.epi.count = dt.vdjdb %>%
+  group_by(species, antigen.epitope, gene) %>%
+  summarise(count = length(unique(cdr3))) %>%
+  arrange(-count)
+
+epi.good = dt.epi.count %>%
+  filter(count >= 30) %>%
+  select(species, gene, antigen.epitope)
+
+dt.vdjdb.good = dt.vdjdb %>%
+  merge(epi.good)
+```
+
+Load alignment scoring
+
+```{r}
+vdjam = fread("params/vdjam.txt")
+data(BLOSUM62)
+
+#pairwiseAlignment("CASSLAPGATNEKLFF",
+#                  "CASSLAAQTNEKLFF",
+#                  substitutionMatrix = BLOSUM62)
+
+aln_mat = BLOSUM62 %>%
+  melt
+colnames(aln_mat) = c("aa.1", "aa.2", "x")
+
+aln_mat = aln_mat %>%
+  merge(vdjam %>% select(aa.1, aa.2, score), all.x=T) %>%
+  mutate(score = ifelse(is.na(score), ifelse(aa.1 == aa.2, 1, -1), score)) %>%
+  select(-x) %>%
+  dcast(aa.1 ~ aa.2)
+rownames(aln_mat) = aln_mat$aa.1
+aln_mat$aa.1 = NULL
+aln_mat = as.matrix(aln_mat)
+```
+
+Load VJ scoring
+
+```{r}
+segm.scores = fread("params/segm_score.txt") 
+
+v.scores = segm.scores %>% 
+  filter(segment == "V") %>%
+  mutate(v.segm.1 = id.1, v.segm.2 = id.2, v.score = segm.score) %>%
+  select(species, gene, v.segm.1, v.segm.2, v.score, cdr1.score, cdr2.score)
+
+j.scores = segm.scores %>% 
+  filter(segment == "J") %>%
+  mutate(j.segm.1 = id.1, j.segm.2 = id.2, j.score = segm.score) %>%
+  select(species, gene, j.segm.1, j.segm.2, j.score)
+```
+
+## Searching similar CDR3s by LV distance within fixed scope
+
+Compute pairwise distances between CDR3s
+
+```{r}
+get_pairs_by_scope_1 = function(cdrs1, cdrs2 = NULL, substs.max = 4, indels.max = 2) {
+  if (is.null(cdrs2)) {
+    cdrs2 = cdrs1
+  }
+  
+  stringdistmatrix(cdrs1, cdrs2,
+                      method = "lv", useNames = T,
+                      nthread = 80) %>%
+    melt %>%
+    mutate(from = as.character(Var1),
+           to = as.character(Var2)) %>%
+    filter(from != to, value <= substs.max + indels.max) %>% 
+    mutate(indels = abs(nchar(from) - nchar(to)), substs = value - indels) %>%
+    filter(indels <= indels.max, substs <= substs.max) %>%
+    select(from, to, indels, substs) %>%
+    as.data.table
+}
+
+get_pairs_by_scope = function(data, s, g, substs.max = 4, indels.max = 2) {
+  data %>%
+    filter(species == s, gene == g) %>%
+    .$cdr3 %>%
+    unique %>%
+    get_pairs_by_scope_1(NULL, substs.max, indels.max) %>%
+    mutate(species = s, gene = g)
+}
+
+cdr3_pairs = dt.vdjdb.good %>%
+  mutate(x = paste(species, gene)) %>%
+  .$x %>%
+  unique %>%
+  strsplit(split = " ") %>%
+  lapply(function(x) get_pairs_by_scope(dt.vdjdb.good, x[1], x[2])) %>%
+  rbindlist
+```
+
+Select pairs by scope threshold, add annotation
+
+```{r}
+tcr_pairs = cdr3_pairs %>%
+  as.data.table %>%
+  merge(dt.vdjdb.good %>%
+          mutate(ag1 = antigen.epitope, from = cdr3,
+                 v.segm.1 = v.segm, j.segm.1 = j.segm) %>%
+          select(species, gene, ag1, from, v.segm.1, j.segm.1) %>%
+          as.data.table,
+        by = c("species", "gene", "from"), allow.cartesian = T) %>%
+  merge(dt.vdjdb.good %>%
+          mutate(ag2 = antigen.epitope, to = cdr3,
+                 v.segm.2 = v.segm, j.segm.2 = j.segm) %>%
+          select(species, gene, ag2, to, v.segm.2, j.segm.2) %>%
+          as.data.table, 
+        by = c("species", "gene", "to"), allow.cartesian = T) %>%
+  # remove records that have no V/J alignment score
+  merge(v.scores %>% select(species, gene, v.segm.1, v.segm.2),
+        by = c("species", "gene", "v.segm.1", "v.segm.2")) %>%
+  merge(j.scores %>% select(species, gene, j.segm.1, j.segm.2),
+        by = c("species", "gene", "j.segm.1", "j.segm.2"))
+```
+
+
+### Selecting TCR pair set for benchmark
+
+Number of pairs for different comparisons
+
+```{r}
+PAIR_COUNT = 200
+
+tcr_pairs.s = tcr_pairs %>%
+  filter(ag1 >= ag2) %>%
+  group_by(species, gene, ag1, ag2) %>%
+  summarise(count = n()) %>%
+  arrange(-count)
+
+tcr_pairs.s %>%
+  filter(count >= PAIR_COUNT) %>% 
+  mutate(x = paste(ag1, ag2)) %>%
+  summarise(pairs_unique = length(unique(x)),
+            count_in_pairs = sum(count)) %>%
+  print
+```
+
+Shuffle and select 200 pairs for each comparison
+
+```{r}
+set.seed(42)
+
+tcr_pairs.sel = tcr_pairs %>%
+  merge(tcr_pairs.s %>% filter(count >= PAIR_COUNT) %>% select(-count),
+        by = c("species", "gene", "ag1", "ag2")) %>%
+  as.data.table %>%
+  group_by(species, gene, ag1, ag2) %>%
+  sample_n(PAIR_COUNT)
+```
+
+## Perform CDR3 alignment
+
+Run alignments
+
+```{r}
+GAP_OFFSET = round(max(abs(max(aln_mat)), abs(min(aln_mat)))) + 2
+
+aln_fun_inner = function(a, b) {
+  pairwiseAlignment(a, b,
+                    substitutionMatrix = aln_mat,
+                    gapOpening = GAP_OFFSET, 
+                    gapExtension = GAP_OFFSET,
+                    scoreOnly=T)
+}
+
+aln_fun = function(x) {
+  first = x[1]
+  second = x[2]
+  data.table(from = first, to = second,
+             aln.score = aln_fun_inner(first, second),
+             aln.score.1 = aln_fun_inner(first, first),
+             aln.score.2 = aln_fun_inner(second, second))
+  }
+    
+cdr3_alns = with(tcr_pairs.sel, paste(from, to)) %>%
+  unique %>%
+  strsplit(" ") %>%
+  mclapply(aln_fun, mc.cores = 80) %>%
+  rbindlist
+```
+
+## Combine partial scores
+
+Correct the score for indels, convert to distance
+
+```{r}
+cdr3_alns = cdr3_alns %>%
+  mutate(indels = abs(nchar(from) - nchar(to)),
+         cdr3.score = aln.score + GAP_OFFSET * indels - pmax(aln.score.1, aln.score.2))
+```
+
+Append annotations
+
+```{r}
+tcr_pairs.sel.1 = tcr_pairs.sel %>% 
+  merge(cdr3_alns %>% select("from", "to", "cdr3.score")) %>%
+  mutate(same.antigen = ag1 == ag2,
+         maxlen = pmax(nchar(from), nchar(to)))
+```
+
+Append V scoring
+
+```{r}
+tcr_pairs.sel.2 = tcr_pairs.sel.1 %>%
+  as.data.frame %>%
+  merge(v.scores) %>%
+  merge(j.scores) %>%
+  as.data.table
+```
+
+## Compute coefficients
+
+Fit GLMs
+
+```{r}
+glm.hb = glm(same.antigen~v.score+j.score+cdr1.score+cdr2.score+cdr3.score,
+            data = tcr_pairs.sel.2 %>% filter(gene == "TRB", species == "HomoSapiens"),
+            family = binomial(link = "cloglog"))
+glm.ha = glm(same.antigen~v.score+j.score+cdr1.score+cdr2.score+cdr3.score,
+            data = tcr_pairs.sel.2 %>% filter(gene == "TRA", species == "HomoSapiens"),
+            family = binomial(link = "cloglog"))
+glm.mb = glm(same.antigen~v.score+j.score+cdr1.score+cdr2.score+cdr3.score,
+            data = tcr_pairs.sel.2 %>% filter(gene == "TRB", species == "MusMusculus"),
+            family = binomial(link = "cloglog"))
+glm.ma = glm(same.antigen~v.score+j.score+cdr1.score+cdr2.score+cdr3.score,
+            data = tcr_pairs.sel.2 %>% filter(gene == "TRA", species == "MusMusculus"),
+            family = binomial(link = "cloglog"))
+
+summary(glm.hb)
+summary(glm.ha)
+summary(glm.mb)
+summary(glm.ma)
+
+glms = list("HomoSapiens-TRB"=glm.hb,
+            "HomoSapiens-TRA"=glm.ha,
+            "MusMusculus-TRB"=glm.mb,
+            "MusMusculus-TRA"=glm.ma)
+```
+
+```{r}
+coefs = cbind(as.data.frame(paste0(format(round(glm.hb$coefficients,4), nsmall = 4), ", P=",
+                                  signif(summary(glm.hb)$coefficients[,4],1))),
+              as.data.frame(paste0(format(round(glm.ha$coefficients,4), nsmall = 4), ", P=",
+                                  signif(summary(glm.ha)$coefficients[,4],1))),
+              as.data.frame(paste0(format(round(glm.mb$coefficients,4), nsmall = 4), ", P=",
+                                  signif(summary(glm.mb)$coefficients[,4],1))),
+              as.data.frame(paste0(format(round(glm.ma$coefficients,4), nsmall = 4), ", P=",
+                                  signif(summary(glm.ma)$coefficients[,4],1))))
+
+colnames(coefs) = c("Human-TRB", "Human-TRA", "Mouse-TRB", "Mouse-TRA")
+rownames(coefs) = names(glm.ma$coefficients)
+print(coefs)
+```
+
+## PR curves
+
+Compute scores
+
+```{r}
+tcr_pairs.sel.3 = data.table()
+
+for (s in unique(tcr_pairs.sel.2$species)) {
+  for (g in unique(tcr_pairs.sel.2$gene)) {
+    tmp = tcr_pairs.sel.2 %>% filter(species == s, gene == g)
+    tmp$p = predict(glms[[paste(s,g,sep="-")]], tmp, type = "response")
+    tcr_pairs.sel.3 = rbind(tcr_pairs.sel.3, tmp)
+  }
+}
+```
+
+> Note that this doesn't account for pre-filtering based on search scope
+
+> https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4349800/ is why we go for PR rather than ROC
+
+AUC function for each antigen pair, runs on custom data
+
+```{r}
+compute_auc = function(s, g, ag_1, ag_2) {
+  tmp = tcr_pairs.sel.3 %>%
+    filter(species == s, gene == g, 
+           ag1 %in% c(ag_1, ag_2),
+           ag2 %in% c(ag_1, ag_2))
+  
+  data.table(species = s,
+             gene = g,
+             ag1 = ag_1,
+             ag2 = ag_2,
+             n.same = nrow(tmp %>% filter(same.antigen == T)),
+             n.diff = nrow(tmp %>% filter(same.antigen == F)),
+             auc = pr.curve(tmp %>% filter(same.antigen == T) %>% .$p,
+                             tmp %>% filter(same.antigen == F) %>% .$p)$auc.integral)
+}
+
+aucs.sel = tcr_pairs.sel.3 %>%
+  filter(!same.antigen) %>%
+  mutate(x = paste(species, gene, ag1, ag2)) %>%
+  .$x %>%
+  unique %>%
+  strsplit(" ") %>%
+  mclapply(function(x) compute_auc(x[1], x[2], x[3], x[4]),
+           mc.cores = 80) %>%
+  rbindlist %>%
+  filter(n.same == 400, n.diff == 200)
+```
+
+```{r}
+p12a=ggplot(aucs.sel %>% filter(species == "HomoSapiens", !is.nan(auc)) %>%
+         mutate(ag1 = substr(ag1, 1, 8),
+                ag2 = substr(ag2, 1, 8),
+                gene = paste(species, gene)),
+       aes(x = ag1, y = ag2)) +
+  geom_tile(aes(fill = auc)) +
+  xlab("") + ylab("") +
+  facet_wrap(~gene, scales = "free") +
+  scale_fill_gradientn("Precision-recall AUC",
+                       colors=colorRampPalette(brewer.pal(11, 'RdYlGn'))(32),
+                       limits = c(0.5,1)) +
+  theme_bw() +
+  theme(legend.position = "bottom",
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, family = "mono"),
+        axis.text.y = element_text(family = "mono"),
+        strip.background = element_blank(),
+        panel.border = element_rect(colour = "black"))
+
+p12a
+pdf("figures/fig12a.pdf", width = 6, height=4)
+p12a
+dev.off()
+
+
+p12b=ggplot(aucs.sel %>% filter(species == "MusMusculus", !is.nan(auc)) %>%
+         mutate(ag1 = substr(ag1, 1, 8),
+                ag2 = substr(ag2, 1, 8),
+                gene = paste(species, gene)),
+       aes(x = ag1, y = ag2)) +
+  geom_tile(aes(fill = auc)) +
+  xlab("") + ylab("") +
+  facet_wrap(~gene, scales = "free") +
+  scale_fill_gradientn("Precision-recall AUC",
+                       colors=colorRampPalette(brewer.pal(11, 'RdYlGn'))(32),
+                       limits = c(0.5,1)) +
+  theme_bw() +
+  theme(legend.position = "bottom",
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, family = "mono"),
+        axis.text.y = element_text(family = "mono"),
+        strip.background = element_blank(),
+        panel.border = element_rect(colour = "black"))
+p12b
+pdf("figures/fig12b.pdf", width = 6, height=4)
+p12b
+dev.off()
+
+
+p12c=ggplot(aucs.sel %>% filter(!is.nan(auc)),
+       aes(x = paste(species, gene), y = auc)) +
+  geom_boxplot() +
+  xlab("") + scale_y_continuous("Precision-recall AUC", labels = percent,
+                                limits = c(0.5,1)) +
+  geom_hline(yintercept = median(aucs.sel$auc, na.rm = T), linetype = "dashed") +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank(),
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+p12c
+pdf("figures/fig12c.pdf", width = 4, height=6)
+p12c
+dev.off()
+
+print(median(aucs.sel$auc, na.rm = T))
+```
+
+## Based on Sewell data
+
+Select data and compute alignments
+
+```{r}
+dt.sew = fread("tet/yf_bst2_5+reads.txt")
+
+dt.sew %>% 
+  group_by(antigen.epitope) %>%
+  summarise(count = n()) %>%
+  print
+```
+
+Fetch pairs within scope and align them
+
+```{r}
+# search by scope
+cdr3_pairs.sew = get_pairs_by_scope_1(dt.sew %>% .$cdr3 %>% unique)
+
+# add annotations
+tcr_pairs.sew = cdr3_pairs.sew %>%
+  as.data.table %>%
+  merge(dt.sew %>%
+          mutate(ag1 = antigen.epitope, from = cdr3,
+                 v.segm.1 = v.segm, j.segm.1 = j.segm) %>%
+          select(ag1, from, v.segm.1, j.segm.1) %>%
+          as.data.table,
+        by = c("from"), allow.cartesian = T) %>%
+  merge(dt.sew %>%
+          mutate(ag2 = antigen.epitope, to = cdr3,
+                 v.segm.2 = v.segm, j.segm.2 = j.segm) %>%
+          select(ag2, to, v.segm.2, j.segm.2) %>%
+          as.data.table, 
+        by = c("to"), allow.cartesian = T)
+
+# aling cdr3
+
+cdr3_alns.sew = with(tcr_pairs.sew, paste(from, to)) %>%
+  unique %>%
+  strsplit(" ") %>%
+  mclapply(aln_fun, mc.cores = 80) %>%
+  rbindlist %>%
+  mutate(indels = abs(nchar(from) - nchar(to)),
+         cdr3.score = aln.score + GAP_OFFSET * indels - pmax(aln.score.1, aln.score.2))
+
+# append info from epitopes
+
+tcr_pairs.sew.1 = tcr_pairs.sew %>% 
+  merge(cdr3_alns.sew, by = c("from", "to", "indels")) %>%
+  mutate(same.antigen = ag1 == ag2,
+         maxlen = pmax(nchar(from), nchar(to)))
+
+# append vj scores
+
+tcr_pairs.sew.2 = tcr_pairs.sew.1 %>%
+                  as.data.frame %>%
+  merge(v.scores) %>%
+  merge(j.scores) %>%
+  as.data.table %>%
+  mutate(same.antigen = ag1 == ag2)
+```
+
+Compute scores manually
+
+```{r}
+tcr_pairs.sew.2$p = predict(glms[[paste("HomoSapiens","TRB",sep="-")]], 
+                            tcr_pairs.sew.2, type = "response")
+```
+
+Get missing (out of scope) pairs
+
+```{r}
+tcr_pairs.sew.3 = with(dt.sew, expand.grid(from = cdr3, to = cdr3)) %>%
+  filter(from != to) %>%
+  as.data.table %>%
+  mutate(from = as.character(from), to = as.character(to)) %>%
+  merge(dt.sew %>% mutate(from = cdr3, ag1 = antigen.epitope,
+                          v.segm.1 = v.segm, j.segm.1 = j.segm) %>%
+          select(from, ag1, v.segm.1, j.segm.1) %>%
+          unique,
+        by = "from", allow.cartesian = T) %>%
+  merge(dt.sew %>% mutate(to = cdr3, ag2 = antigen.epitope,
+                          v.segm.2 = v.segm, j.segm.2 = j.segm) %>%
+          select(to, ag2, v.segm.2, j.segm.2) %>%
+          unique,
+        by = "to", allow.cartesian = T)
+```
+
+Combine scores
+
+```{r}
+tcr_pairs.sew.4 = tcr_pairs.sew.3 %>%
+  merge(tcr_pairs.sew.2 %>%
+          select(ag1, ag2, from, to, v.segm.1, v.segm.2, j.segm.1, j.segm.2, p),
+        all.x=T, by = c("ag1", "ag2", "from", "to", 
+                        "v.segm.1", "v.segm.2", "j.segm.1", "j.segm.2")) %>%
+  mutate(p = ifelse(is.na(p), 0, p))
+```
+
+Compute match frequency
+
+```{r}
+bg_pairs.sew = get_pairs_by_scope_1(dt.vdjdb.good %>% 
+                                      filter(species == "HomoSapiens", gene == "TRB",
+                                             !(cdr3 %in% dt.sew$cdr3)) %>%
+                                      .$cdr3 %>% unique,
+                                    dt.sew %>% 
+                                      filter(antigen.epitope == "LLWNGPMAV") %>%
+                                      .$cdr3 %>% unique)
+
+match.freq.LLW = bg_pairs.sew %>%
+  mutate(total = length(unique(from))) %>%
+  group_by(to, total) %>%
+  summarise(I = -log10(length(unique(from)) / total)) %>%
+  select(-total)
+```
+
+Compute best score
+
+```{r}
+tcr_matches.sew = tcr_pairs.sew.4 %>%
+  as.data.table %>%
+  merge(match.freq.LLW, by = "to") %>%
+  group_by(ag1, from, v.segm.1, j.segm.1) %>%
+  summarise(best.score = max(p * I))
+```
+
+Have a glance on results
+
+```{r}
+x = pr.curve(tcr_matches.sew %>% filter(ag1 == "LLWNGPMAV") %>% .$best.score, 
+         tcr_matches.sew %>% filter(ag1 != "LLWNGPMAV") %>% .$best.score, 
+         curve = T,
+         rand.compute = T)
+x
+plot(x) 
+
+dt.pr.sew = with(x, data.frame(algorithm = "VDJmatch",
+                               title = "LLW/LLL vs LLW TRB",
+                               auc = auc.integral,
+                               recall = curve[,1],
+                               precision = curve[,2],
+                               threshold = curve[,3]))
+```
+
+Load results from TCRdist and GLIPH
+
+```{r}
+tcrdist_gliph_sew = fread("tet/yf_tcrdist_gliph.txt")
+```
+
+```{r}
+tcrdist_sew = tcrdist_gliph_sew %>%
+  group_by(cdr3, v.segm, j.segm) %>%
+  summarise(best.score = LLWNGPMAV_wtd_nbrdist_10,
+            ag1 = antigen.epitope)
+```
+
+```{r}
+x = pr.curve(tcrdist_sew %>% filter(ag1 == "LLWNGPMAV") %>% .$best.score * -1, 
+         tcrdist_sew %>% filter(ag1 != "LLWNGPMAV") %>% .$best.score * -1, 
+         curve = T,
+         rand.compute = T)
+x
+plot(x)
+
+dt.pr.sew = rbind(dt.pr.sew, with(x, data.frame(algorithm = "TCRdist", 
+                                            title = "LLW/LLL vs LLW TRB",
+                                            auc = auc.integral, 
+                                            recall = curve[,1], 
+                                            precision = curve[,2],
+                                            threshold = curve[,3])))
+```
+
+```{r}
+sew.g1 = tcrdist_gliph_sew %>%
+  filter(gliph_cluster != "") %>%
+  mutate(signature1 = paste(v.segm, j.segm, cdr3), ag1 = antigen.epitope) %>%
+  select(gliph_cluster, gene, ag1, signature1)
+sew.g2 = tcrdist_gliph_sew %>%
+  filter(gliph_cluster != "") %>%
+  mutate(signature2 = paste(v.segm, j.segm, cdr3), ag2 = antigen.epitope) %>%
+  select(gliph_cluster, gene, ag2, signature2)
+
+cluster_type = tcrdist_gliph_sew %>%
+  filter(gliph_cluster != "") %>%
+  group_by(gene, gliph_cluster) %>%
+  summarise(ag = ifelse(sum(antigen.epitope == "LLWNGPMAV") > 
+                          sum(antigen.epitope != "LLWNGPMAV"), 
+                          "LLW", "LLL"),
+            size = n())
+
+unclustered_LLW = cluster_type %>%
+  filter(ag == "LLW" & size == 1) %>%
+  nrow()
+
+unclustered_LLL = cluster_type %>%
+  filter(ag != "LLW" & size == 1) %>%
+  nrow()
+
+sew.gg = merge(sew.g1, sew.g2, allow.cartesian = T) %>%
+  filter(signature1 != signature2) %>%
+  summarise(TP = sum(ag1 == "LLWNGPMAV" & ag1 == ag2),
+            FP = sum(ag1 == "LLWNGPMAV" & ag1 != ag2) + unclustered_LLW,
+            FN = sum(ag1 != "LLWNGPMAV" & ag1 != ag2) + unclustered_LLL,
+            TN = sum(ag1 != "LLWNGPMAV" & ag1 == ag2)) %>%
+  mutate(title = "LLW/LLL vs LLW TRB")
+```
+
+Final plot
+
+```{r}
+ggplot(dt.pr.sew %>%
+         group_by(algorithm, recall) %>%
+         summarise(precision = max(precision)),
+       aes(x = recall, y = precision)) +
+  geom_line(aes(linetype = algorithm)) +
+  geom_point(data = sew.gg, aes(x = TP / (TP + FN), 
+                            y = TP / (TP + FP))) +
+  geom_text(data = sew.gg, aes(x = TP / (TP + FN)+0.1, 
+                           y = TP / (TP + FP)+0.04, label = "GLIPH")) +
+  scale_y_continuous("Precision", labels = percent, limits = c(0,1)) +
+  scale_x_continuous("Recall", labels = percent, limits = c(0,1)) +
+  theme_bw() +
+  theme(aspect = 1, legend.position = "bottom",
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.border = element_rect(colour = "black"))
+```
+## Based on Egorov data
+
+Load data
+
+```{r}
+dt.cmv = fread("tet/cmv_5+reads.txt") %>%
+  mutate(antigen.epitope = "NLVPMVATV")
+
+dt.cmv %>% 
+  group_by(type, gene) %>%
+  summarise(count = n()) %>%
+  print
+```
+
+```{r}
+# search by scope
+cdr3_pairs.cmv = get_pairs_by_scope_1(dt.cmv %>% 
+                                        filter(gene == "TRA") %>%
+                                        .$cdr3 %>%
+                                        unique,
+                                      dt.vdjdb %>% 
+                                        filter(gene == "TRA", antigen.epitope == "NLVPMVATV") %>%
+                                        .$cdr3 %>%
+                                        unique) %>%
+  rbind(get_pairs_by_scope_1(dt.cmv %>% 
+                               filter(gene == "TRB") %>%
+                               .$cdr3 %>%
+                               unique,
+                             dt.vdjdb %>% 
+                               filter(gene == "TRB", antigen.epitope == "NLVPMVATV") %>%
+                               .$cdr3 %>%
+                               unique))
+```
+
+```{r}
+# add annotations
+tcr_pairs.cmv = cdr3_pairs.cmv %>%
+  as.data.table %>%
+  merge(dt.cmv %>%
+          mutate(ag1 = antigen.epitope, from = cdr3,
+                 v.segm.1 = v.segm, j.segm.1 = j.segm) %>%
+          select(gene, ag1, from, v.segm.1, j.segm.1) %>%
+          as.data.table,
+        by = c("from"), allow.cartesian = T) %>%
+  merge(dt.vdjdb %>%
+          filter(antigen.epitope == "NLVPMVATV") %>%
+          mutate(ag2 = antigen.epitope, to = cdr3,
+                 v.segm.2 = v.segm, j.segm.2 = j.segm) %>%
+          select(gene, ag2, to, v.segm.2, j.segm.2) %>%
+          as.data.table, 
+        by = c("gene", "to"), allow.cartesian = T)
+```
+
+```{r}
+# aling cdr3
+
+cdr3_alns.cmv = with(tcr_pairs.cmv, paste(from, to)) %>%
+  unique %>%
+  strsplit(" ") %>%
+  mclapply(aln_fun, mc.cores = 80) %>%
+  rbindlist %>%
+  mutate(indels = abs(nchar(from) - nchar(to)),
+         cdr3.score = aln.score + GAP_OFFSET * indels - pmax(aln.score.1, aln.score.2))
+
+# append info from epitopes
+
+tcr_pairs.cmv.1 = tcr_pairs.cmv %>% 
+  merge(cdr3_alns.cmv, by = c("from", "to", "indels"))
+
+# append vj scores
+
+tcr_pairs.cmv.2 = tcr_pairs.cmv.1 %>%
+                  as.data.frame %>%
+  merge(v.scores) %>%
+  merge(j.scores) %>%
+  as.data.table
+```
+
+Compute scores manually
+
+```{r}
+tcr_pairs.cmv.2$p = predict(glms[[paste("HomoSapiens","TRB",sep="-")]], 
+                            tcr_pairs.cmv.2, type = "response")
+```
+
+Add info & missing alignments
+
+```{r}
+tcr_pairs.cmv.3 = tcr_pairs.cmv.2 %>%
+  merge(dt.cmv %>% mutate(gene = gene,
+                          v.segm.1 = v.segm, j.segm.1 = j.segm, from = cdr3) %>%
+          select(gene, v.segm.1, j.segm.1, from, type), all.y = T) %>%
+  mutate(p = ifelse(is.na(p), 0, p))
+```
+
+Compute match frequency
+
+```{r}
+cmv.cdrb.bg = dt.vdjdb.good %>% 
+  filter(species == "HomoSapiens", gene == "TRB",
+         antigen.epitope != "NLVPMVATV") %>%
+  .$cdr3 %>% unique
+cmv.cdrb = dt.vdjdb.good %>% 
+  filter(species == "HomoSapiens", gene == "TRB",
+         antigen.epitope == "NLVPMVATV") %>%
+  .$cdr3 %>% unique
+
+match.freq.cmvb = cdr3_pairs %>%
+  filter(from %in% cmv.cdrb.bg, to %in% cmv.cdrb) %>%
+  mutate(total = length(unique(from))) %>%
+  group_by(to, total) %>%
+  summarise(I = -log10(length(unique(from)) / total)) %>%
+  select(-total)
+
+
+cmv.cdra.bg = dt.vdjdb.good %>% 
+  filter(species == "HomoSapiens", gene == "TRA",
+         antigen.epitope != "NLVPMVATV") %>%
+  .$cdr3 %>% unique
+cmv.cdra = dt.vdjdb.good %>% 
+  filter(species == "HomoSapiens", gene == "TRA",
+         antigen.epitope == "NLVPMVATV") %>%
+  .$cdr3 %>% unique
+
+match.freq.cmva = cdr3_pairs %>%
+  filter(from %in% cmv.cdra.bg, to %in% cmv.cdra) %>%
+  mutate(total = length(unique(from))) %>%
+  group_by(to, total) %>%
+  summarise(I = -log10(length(unique(from)) / total)) %>%
+  select(-total)
+```
+
+Compute best score
+
+```{r}
+tcr_matches.cmv = tcr_pairs.cmv.3 %>%
+  as.data.table %>%
+  merge(rbind(match.freq.cmvb, match.freq.cmva), by = c("to"), all.x=T) %>%
+  mutate(I = ifelse(is.na(I), 4, I)) %>%
+  group_by(gene, type, from, v.segm.1, j.segm.1) %>%
+  summarise(best.score = max(p * I))
+```
+
+Have a glance on results
+
+```{r}
+x = pr.curve(tcr_matches.cmv %>% filter(gene == "TRB", type == "cmv") %>% .$best.score, 
+         tcr_matches.cmv %>% filter(gene == "TRB", type != "cmv") %>% .$best.score, 
+         curve = T,
+         rand.compute = T)
+x
+plot(x) 
+
+dt.pr.cmv = with(x, data.frame(algorithm = "VDJmatch",
+                               title = "CMV-tet TRB",
+                               auc = auc.integral,
+                               recall = curve[,1],
+                               precision = curve[,2],
+                               threshold = curve[,3]))
+
+x = pr.curve(tcr_matches.cmv %>% filter(gene == "TRA", type == "cmv") %>% .$best.score, 
+         tcr_matches.cmv %>% filter(gene == "TRA", type != "cmv") %>% .$best.score, 
+         curve = T,
+         rand.compute = T)
+x
+plot(x) 
+
+dt.pr.cmv = rbind(dt.pr.cmv,
+                  with(x, data.frame(algorithm = "VDJmatch",
+                                     title = "CMV-tet TRA",
+                                     auc = auc.integral,
+                                     recall = curve[,1],
+                                     precision = curve[,2],
+                                     threshold = curve[,3])))
+```
+
+```{r}
+tcrdist_gliph_cmv = fread("tet/cmv_tcrdist_gliph.txt")
+```
+
+Compute precision and recall proxies for gliph
+
+```{r}
+cmv.g1 = tcrdist_gliph_cmv %>%
+  filter(gliph_cluster != "") %>%
+  mutate(signature1 = paste(v.segm.1, j.segm.1, cdr3), type1 = type) %>%
+  select(gliph_cluster, gene, type1, signature1)
+cmv.g2 = tcrdist_gliph_cmv %>%
+  filter(gliph_cluster != "") %>%
+  mutate(signature2 = paste(v.segm.1, j.segm.1, cdr3), type2 = type) %>%
+  select(gliph_cluster, gene, type2, signature2)
+
+cmv.cluster_type = tcrdist_gliph_cmv %>%
+  filter(gliph_cluster != "") %>%
+  group_by(gene, gliph_cluster) %>%
+  summarise(type = ifelse(sum(type == "cmv") > sum(type != "cmv"), "cmv", "control"),
+            size = n())
+
+cmv.unclustered_cmv = cmv.cluster_type %>%
+  filter(type == "cmv" & size == 1) %>%
+  nrow()
+
+cmv.unclustered_control = cmv.cluster_type %>%
+  filter(type != "cmv" & size == 1) %>%
+  nrow()
+
+cmv.gg = merge(cmv.g1, cmv.g2) %>%
+  filter(signature1 != signature2) %>%
+  group_by(gene) %>%
+  summarise(TP = sum(type1 == "cmv" & type1 == type2),
+            FP = sum(type1 == "cmv" & type1 != type2) + cmv.unclustered_cmv,
+            FN = sum(type1 != "cmv" & type1 != type2) + cmv.unclustered_control,
+            TN = sum(type1 != "cmv" & type1 == type2)) %>%
+  mutate(title = "CMV-tet TRB")
+```
+
+```{r}
+x = pr.curve(tcrdist_gliph_cmv %>% 
+               filter(gene == "TRB", type == "cmv") %>%
+               .$wtd_nbrdist_10 * -1, 
+         tcrdist_gliph_cmv %>% 
+           filter(gene == "TRB", type != "cmv") %>%
+           .$wtd_nbrdist_10 * -1,
+         curve = T,
+         rand.compute = T)
+x
+plot(x)
+
+dt.pr.cmv = rbind(dt.pr.cmv, with(x, data.frame(algorithm = "TCRdist", 
+                   auc = auc.integral, 
+                   title = "CMV-tet TRB",
+                   recall = curve[,1], 
+                   precision  = curve[,2],
+                   threshold = curve[,3])))
+
+x = pr.curve(tcrdist_gliph_cmv %>% 
+               filter(gene == "TRA", type == "cmv") %>%
+               .$wtd_nbrdist_10 * -1, 
+         tcrdist_gliph_cmv %>% 
+           filter(gene == "TRA", type != "cmv") %>%
+           .$wtd_nbrdist_10 * -1,
+         curve = T,
+         rand.compute = T)
+x
+plot(x)
+
+dt.pr.cmv = rbind(dt.pr.cmv, with(x, data.frame(algorithm = "TCRdist", 
+                   auc = auc.integral, 
+                   title = "CMV-tet TRA",
+                   recall = curve[,1], 
+                   precision  = curve[,2],
+                   threshold = curve[,3])))
+```
+
+Final plot
+
+```{r}
+ggplot(dt.pr.cmv %>%
+         group_by(title, algorithm, recall) %>%
+         summarise(precision = max(precision)),
+       aes(x = recall, y = precision)) +
+  geom_line(aes(linetype = algorithm)) +
+  geom_point(data = cmv.gg, aes(x = TP / (TP + FN), 
+                            y = TP / (TP + FP))) +
+  geom_text(data = cmv.gg, aes(x = TP / (TP + FN)+0.1, 
+                           y = TP / (TP + FP)+0.04, label = "GLIPH")) +
+  scale_y_continuous("Precision", labels = percent, limits = c(0,1)) +
+  scale_x_continuous("Recall", labels = percent, limits = c(0,1)) +
+  theme_bw() +
+  facet_wrap(~title) +
+  theme(aspect = 1, legend.position = "bottom",
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.border = element_rect(colour = "black"))
+```
+
+Final comparison plot
+
+```{r}
+p13=ggplot(rbind(dt.pr.cmv, dt.pr.sew) %>%
+         group_by(title, algorithm, recall) %>%
+         summarise(precision = max(precision)),
+       aes(x = recall, y = precision)) +
+  geom_line(aes(color = algorithm)) +
+  geom_point(data = cmv.gg, aes(x = TP / (TP + FN), 
+                            y = TP / (TP + FP))) +
+  geom_text(data = cmv.gg, aes(x = TP / (TP + FN)+0.15, 
+                           y = TP / (TP + FP)+0.04, label = "GLIPH")) +
+  geom_point(data = sew.gg, aes(x = TP / (TP + FN), 
+                            y = TP / (TP + FP))) +
+  geom_text(data = sew.gg, aes(x = TP / (TP + FN)+0.15, 
+                           y = TP / (TP + FP)+0.04, label = "GLIPH")) +
+  scale_y_continuous("Precision", labels = percent, limits = c(0,1)) +
+  scale_x_continuous("Recall", labels = percent, limits = c(0,1)) +
+  scale_color_manual(values = c("red", "blue")) +
+  theme_bw() +
+  facet_wrap(~title) +
+  theme(legend.position = "bottom",
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_blank(),
+        strip.background = element_blank(),
+        panel.border = element_rect(colour = "black"))
+
+p13
+pdf("figures/p13.pdf", width = 8, height = 4)
+p13
+dev.off()
+```
+
+
+
+
+
+
+
+
+
+
+
+
